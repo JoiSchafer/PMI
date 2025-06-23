@@ -23,8 +23,8 @@ A proposta surgiu a partir de um **projeto de extensão**, no qual foi identific
 | Componente            | Descrição                                                                                          |
 | --------------------- | -------------------------------------------------------------------------------------------------- |
 | **Python + Selenium** | Coleta automatizada dos dados diretamente do site [Compras.gov.br](https://www.comprasnet.gov.br/) |
-| **Pandas**            | Limpeza e preparação dos dados                                                                     |
 | **SQL Server**        | Armazenamento estruturado dos contratos extraídos                                                  |
+| **SQL**               | Limpeza e preparação dos dados                                                                     |
 | **Power BI**          | Visualização interativa e análise preditiva para gestores públicos                                 |
 
 ---
