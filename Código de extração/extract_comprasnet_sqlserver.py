@@ -11,12 +11,12 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 import pandas as pd
 import pyodbc
+from pathlib import Path
 
 # Gera a data atual no formato dd-mm-yyyy
 data_str = datetime.now().strftime('%d-%m-%Y')
 
 # Caminho base desejado
-from pathlib import Path
 base_dir = str(Path.home() / "Downloads")
 download_dir = os.path.join(base_dir, f"extract_comprasnet_{data_str}")
 os.makedirs(download_dir, exist_ok=True)
@@ -28,7 +28,7 @@ def create_driver_instance(url):
     prefs = {
         "download.default_directory": download_dir_win,
         "download.prompt_for_download": False,
-        "directory_upgrade": True,
+        "download.directory_upgrade": True,
         "profile.default_content_setting_values.automatic_downloads": 1
     }
     chrome_options.add_experimental_option("prefs", prefs)
@@ -38,10 +38,8 @@ def create_driver_instance(url):
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
     driver.get(url)
-    driver.implicitly_wait(8)
     return driver
 
-# Scrolls
 def scroll_to_bottom(driver):
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
     sleep(1)
@@ -51,8 +49,10 @@ def scroll_to_top(driver):
     sleep(1)
 
 # Abre o navegador e acessa o ComprasNet
-driver = create_driver_instance('https://contratos.comprasnet.gov.br/transparencia/contratos?orgao=%5B%2236000%22%5D')
-driver.implicitly_wait(8) 
+driver = create_driver_instance(
+    'https://contratos.comprasnet.gov.br/transparencia/contratos?orgao=%5B%2236000%22%5D'
+)
+driver.implicitly_wait(8)
 scroll_to_bottom(driver)
 sleep(5)
 
@@ -82,27 +82,24 @@ for i in range(3, 29):
 scroll_to_top(driver)
 sleep(2)
 
-WebDriverWait(driver, 30).until(
-    EC.element_to_be_clickable((By.XPATH, '//*[@id="datatable_button_stack"]/div/button[3]'))
-) 
-
+# A partir daqui entra a lógica de navegação e download das planilhas
 try:
     while True:
-        scroll_to_top(driver)
-        sleep(5)
-        download_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CLASS_NAME, 'buttons-excel'))
+        # Botão para exportar página atual para Excel
+        export_button = WebDriverWait(driver, 40).until(
+            EC.element_to_be_clickable(
+                (By.XPATH, '//*[@id="datatable_button_stack"]/div/button[3]')
+            )
         )
-        download_button.click()
-        print("Baixando o arquivo da página atual")
-        sleep(10) 
+        export_button.click()
+        print("Planilha Excel baixada para a página atual.")
+        sleep(25)
 
-        next_button_disabled = driver.find_elements(By.CSS_SELECTOR, 'li.paginate_button.next.disabled')
-        if next_button_disabled:
-            print("Última página. Parando o script.")
-            break
+        scroll_to_bottom(driver)
+        sleep(5)
 
-        next_button = WebDriverWait(driver, 10).until(
+        # Tenta clicar no botão "Próxima página"
+        next_button = WebDriverWait(driver, 40).until(
             EC.element_to_be_clickable((By.XPATH, '//*[@id="crudTable_next"]/a'))
         )
         next_button.click()
@@ -117,13 +114,6 @@ sleep(5)
 # Lista arquivos .xlsx baixados
 xlsx_files = [f for f in os.listdir(download_dir) if f.endswith(".xlsx")]
 xlsx_file_paths = [os.path.join(download_dir, f) for f in xlsx_files]
-
-for file_path in xlsx_file_paths:
-    print(f" Arquivo encontrado: {file_path}")
-
-print(f"\n Total de arquivos encontrados: {len(xlsx_file_paths)}")
-
-sleep(5)
 
 # ---------------------- SQL SERVER (NOVO DESTINO) ----------------------
 
@@ -143,8 +133,11 @@ conn_str = (
 conn = pyodbc.connect(conn_str)
 cursor = conn.cursor()
 
-# Nome da tabela com base na data
-tabela_destino = f"Contratos_{data_str.replace('-', '_')}"
+# Nome fixo da tabela de destino
+tabela_destino = "Contratos_Comprasnet"
+
+# Colunas que identificam de forma única um contrato
+KEY_COLS = ["Número do Contrato", "Data de Assinatura"]
 total_inseridos = 0
 
 for file_path in xlsx_file_paths:
@@ -158,20 +151,55 @@ for file_path in xlsx_file_paths:
 
         # Cria a tabela se ainda não existir
         colunas_sql = ", ".join([f"[{col}] NVARCHAR(MAX)" for col in df.columns])
-        create_table_sql = f"IF OBJECT_ID('{tabela_destino}', 'U') IS NULL CREATE TABLE {tabela_destino} ({colunas_sql})"
+        create_table_sql = (
+            f"IF OBJECT_ID('{tabela_destino}', 'U') IS NULL "
+            f"CREATE TABLE {tabela_destino} ({colunas_sql})"
+        )
         cursor.execute(create_table_sql)
         conn.commit()
 
-        # Insere os dados
+        # Verifica se as colunas de chave existem no DataFrame
+        missing_keys = [col for col in KEY_COLS if col not in df.columns]
+        if missing_keys:
+            raise ValueError(
+                f"As colunas de chave {missing_keys} não foram encontradas "
+                f"no arquivo {os.path.basename(file_path)}."
+            )
+
+        # Insere os dados apenas para contratos ainda não existentes
         placeholders = ", ".join(["?"] * len(df.columns))
-        insert_sql = f"INSERT INTO {tabela_destino} ({', '.join(f'[{col}]' for col in df.columns)}) VALUES ({placeholders})"
+        insert_sql = (
+            f"INSERT INTO {tabela_destino} "
+            f"({', '.join(f'[{col}]' for col in df.columns)}) "
+            f"VALUES ({placeholders})"
+        )
+
+        registros_inseridos_arquivo = 0
 
         for _, row in df.iterrows():
-            cursor.execute(insert_sql, tuple(row.fillna("").astype(str)))
+            # Monta a consulta de verificação usando a chave (Número do Contrato + Data de Assinatura)
+            key_values = [str(row[col]) for col in KEY_COLS]
+            where_clause = " AND ".join(f"[{col}] = ?" for col in KEY_COLS)
+            check_sql = f"SELECT 1 FROM {tabela_destino} WHERE {where_clause}"
+
+            cursor.execute(check_sql, key_values)
+            exists = cursor.fetchone()
+
+            if exists:
+                # Já existe contrato com a mesma chave, não insere novamente
+                continue
+
+            # Insere o registro novo
+            all_values = list(row.fillna("").astype(str))
+            cursor.execute(insert_sql, all_values)
+            registros_inseridos_arquivo += 1
 
         conn.commit()
-        total_inseridos += len(df)
-        print(f"{len(df)} registros inseridos do arquivo {os.path.basename(file_path)}")
+        total_inseridos += registros_inseridos_arquivo
+        print(
+            f"{registros_inseridos_arquivo} registros inseridos do arquivo "
+            f"{os.path.basename(file_path)}"
+        )
 
     except Exception as e:
         print(f"Erro ao processar {file_path}: {e}")
